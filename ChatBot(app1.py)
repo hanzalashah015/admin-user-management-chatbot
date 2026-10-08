@@ -1,0 +1,1352 @@
+import streamlit as st
+import sqlite3
+import re
+import json
+import pandas as pd
+from groq import Groq
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DB_NAME = "users_db.sqlite"
+GROQ_MODEL = "openai/gpt-oss-20b"
+
+st.set_page_config(
+    page_title="Admin User Management Chatbot",
+    page_icon="🤖",
+    layout="wide"
+)
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def get_connection():
+    return sqlite3.connect(DB_NAME)
+
+
+def init_db():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            phone TEXT,
+            city TEXT
+        )
+    """)
+
+    # Default admin
+    cursor.execute("""
+        INSERT OR IGNORE INTO users
+        (name, email, phone, city)
+        VALUES (?, ?, ?, ?)
+    """, (
+        "Admin User",
+        "test06.wpbrigade@gmail.com",
+        "+923000000000",
+        "Lahore"
+    ))
+
+    # Sample user
+    cursor.execute("""
+        INSERT OR IGNORE INTO users
+        (name, email, phone, city)
+        VALUES (?, ?, ?, ?)
+    """, (
+        "Samantha",
+        "samantha@example.com",
+        "+923001112233",
+        "Lahore"
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+# ============================================================
+# DATABASE FUNCTIONS
+# ============================================================
+
+def get_all_users():
+    conn = get_connection()
+
+    df = pd.read_sql_query("""
+        SELECT id, name, email, phone, city
+        FROM users
+        ORDER BY id
+    """, conn)
+
+    conn.close()
+
+    df.columns = ["ID", "Name", "Email", "Phone", "City"]
+
+    return df
+
+
+def get_user_by_email(email):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, name, email, phone, city
+        FROM users
+        WHERE LOWER(email) = LOWER(?)
+    """, (email.strip(),))
+
+    user = cursor.fetchone()
+
+    conn.close()
+
+    return user
+
+
+def get_users_by_name(name):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, name, email, phone, city
+        FROM users
+        WHERE LOWER(name) = LOWER(?)
+    """, (name.strip(),))
+
+    users = cursor.fetchall()
+
+    conn.close()
+
+    return users
+
+
+def get_user_by_identifier(identifier):
+    """
+    Finds a user using:
+    - Email
+    - Exact name
+    - First name
+    - Username from email
+    """
+
+    identifier = identifier.strip()
+
+    # Remove possessive "'s"
+    identifier = re.sub(
+        r"['’]s$",
+        "",
+        identifier,
+        flags=re.IGNORECASE
+    ).strip()
+
+    # Remove "the user"
+    identifier = re.sub(
+        r"^the\s+user\s+",
+        "",
+        identifier,
+        flags=re.IGNORECASE
+    ).strip()
+
+    # --------------------------------------------------------
+    # 1. Search by email
+    # --------------------------------------------------------
+
+    if "@" in identifier:
+        user = get_user_by_email(identifier)
+
+        if user:
+            return user
+
+    # --------------------------------------------------------
+    # 2. Exact name
+    # --------------------------------------------------------
+
+    users = get_users_by_name(identifier)
+
+    if len(users) == 1:
+        return users[0]
+
+    # --------------------------------------------------------
+    # 3. Search by first name
+    #
+    # Example:
+    # John -> John Smith
+    # Samantha -> Samantha
+    # --------------------------------------------------------
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, name, email, phone, city
+        FROM users
+        WHERE LOWER(name) LIKE LOWER(?)
+    """, (identifier + " %",))
+
+    first_name_users = cursor.fetchall()
+
+    conn.close()
+
+    if len(first_name_users) == 1:
+        return first_name_users[0]
+
+    # --------------------------------------------------------
+    # 4. Search email username
+    #
+    # john.smith@xyz.com
+    # -> john.smith
+    # --------------------------------------------------------
+
+    if "@" not in identifier:
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT id, name, email, phone, city
+            FROM users
+            WHERE LOWER(email) LIKE LOWER(?)
+        """, (identifier + "@%",))
+
+        email_users = cursor.fetchall()
+
+        conn.close()
+
+        if len(email_users) == 1:
+            return email_users[0]
+
+    return None
+
+
+def make_name_from_email(email):
+    username = email.split("@")[0]
+
+    username = re.sub(
+        r"[._-]+",
+        " ",
+        username
+    )
+
+    username = re.sub(
+        r"\s+",
+        " ",
+        username
+    ).strip()
+
+    return username.title()
+
+
+# ============================================================
+# ADD USER
+# ============================================================
+
+def add_user(email, phone="", city="", name=None):
+
+    email = email.strip()
+    phone = phone.strip()
+    city = city.strip()
+
+    if not email:
+        return False, "Email is required."
+
+    if not name or not name.strip():
+        name = make_name_from_email(email)
+    else:
+        name = name.strip()
+
+    existing_user = get_user_by_email(email)
+
+    if existing_user:
+        return False, (
+            f"User with email **{email}** already exists."
+        )
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+
+        cursor.execute("""
+            INSERT INTO users
+            (name, email, phone, city)
+            VALUES (?, ?, ?, ?)
+        """, (
+            name,
+            email,
+            phone,
+            city
+        ))
+
+        conn.commit()
+
+    except sqlite3.IntegrityError:
+
+        conn.close()
+
+        return False, (
+            f"User with email **{email}** already exists."
+        )
+
+    conn.close()
+
+    return True, f"""
+User added successfully.
+
+**Name:** {name}
+
+**Email:** {email}
+
+**Phone:** {phone if phone else "Not provided"}
+
+**City:** {city if city else "Not provided"}
+"""
+
+
+# ============================================================
+# DELETE USER
+# ============================================================
+
+def remove_user(identifier):
+
+    identifier = identifier.strip()
+
+    user = get_user_by_identifier(identifier)
+
+    if not user:
+        return False, (
+            f"I could not find a user named or identified as "
+            f"**{identifier}**."
+        )
+
+    user_id = user[0]
+    name = user[1]
+    email = user[2]
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "DELETE FROM users WHERE id = ?",
+        (user_id,)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return True, f"""
+User deleted successfully.
+
+**Name:** {name}
+
+**Email:** {email}
+"""
+
+
+# ============================================================
+# UPDATE USER
+# ============================================================
+
+def update_user(identifier, field, value):
+
+    identifier = identifier.strip()
+    field = field.lower().strip()
+    value = value.strip()
+
+    if not value:
+        return False, "The new value cannot be empty."
+
+    user = get_user_by_identifier(identifier)
+
+    if not user:
+        return False, (
+            f"I could not find a user named or identified as "
+            f"**{identifier}**."
+        )
+
+    user_id = user[0]
+
+    old_name = user[1]
+    old_email = user[2]
+    old_phone = user[3]
+    old_city = user[4]
+
+    # Convert alternative words
+    if field in ["number", "mobile", "contact"]:
+        field = "phone"
+
+    allowed_fields = {
+        "name": "name",
+        "email": "email",
+        "phone": "phone",
+        "city": "city"
+    }
+
+    if field not in allowed_fields:
+        return False, (
+            "I can update only: "
+            "**name, email, phone, city**."
+        )
+
+    database_field = allowed_fields[field]
+
+    # Check duplicate email
+    if field == "email":
+
+        existing_user = get_user_by_email(value)
+
+        if existing_user and existing_user[0] != user_id:
+            return False, (
+                f"Another user already has the email "
+                f"**{value}**."
+            )
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+
+        cursor.execute(
+            f"""
+            UPDATE users
+            SET {database_field} = ?
+            WHERE id = ?
+            """,
+            (value, user_id)
+        )
+
+        conn.commit()
+
+    except sqlite3.IntegrityError:
+
+        conn.close()
+
+        return False, (
+            "The update could not be completed "
+            "because of a database constraint."
+        )
+
+    conn.close()
+
+    new_name = value if field == "name" else old_name
+    new_email = value if field == "email" else old_email
+    new_phone = value if field == "phone" else old_phone
+    new_city = value if field == "city" else old_city
+
+    return True, f"""
+User updated successfully.
+
+**Name:** {new_name}
+
+**Email:** {new_email}
+
+**Phone:** {new_phone if new_phone else "Not provided"}
+
+**City:** {new_city if new_city else "Not provided"}
+"""
+
+
+# ============================================================
+# LOCAL COMMAND PARSER
+# ============================================================
+
+def find_email(text):
+
+    match = re.search(
+        r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}",
+        text
+    )
+
+    if match:
+        return match.group(0)
+
+    return None
+
+
+def clean_identifier(identifier):
+
+    identifier = identifier.strip()
+
+    identifier = re.sub(
+        r"^the\s+user\s+",
+        "",
+        identifier,
+        flags=re.IGNORECASE
+    )
+
+    identifier = re.sub(
+        r"['’]s$",
+        "",
+        identifier,
+        flags=re.IGNORECASE
+    )
+
+    identifier = identifier.strip(" .?!\"'")
+
+    return identifier.strip()
+
+
+def parse_local_command(command):
+
+    original = command.strip()
+
+    # ========================================================
+    # DELETE
+    # ========================================================
+
+    if re.search(
+        r"\b(delete|remove|drop)\b",
+        original,
+        re.IGNORECASE
+    ):
+
+        email = find_email(original)
+
+        if email:
+
+            return {
+                "action": "delete",
+                "identifier": email
+            }
+
+        match = re.search(
+            r"(?:delete|remove|drop)"
+            r"\s+(?:the\s+)?(?:user\s+)?(.+)$",
+            original,
+            re.IGNORECASE
+        )
+
+        if match:
+
+            identifier = clean_identifier(
+                match.group(1)
+            )
+
+            if identifier:
+
+                return {
+                    "action": "delete",
+                    "identifier": identifier
+                }
+
+    # ========================================================
+    # ADD
+    # ========================================================
+
+    if re.search(
+        r"\b(add|create|register)\b",
+        original,
+        re.IGNORECASE
+    ):
+
+        email = find_email(original)
+
+        if email:
+
+            phone = ""
+            city = ""
+            name = ""
+
+            # Phone
+            phone_match = re.search(
+                r"(?:phone|number|mobile|contact)"
+                r"\s*(?:number)?"
+                r"\s*(?:is|:)?\s*"
+                r"([+\d][+\d\s()\-]{2,})"
+                r"(?=\s+(?:and|city|name)\b|$)",
+                original,
+                re.IGNORECASE
+            )
+
+            if phone_match:
+                phone = phone_match.group(1).strip()
+
+            # City
+            city_match = re.search(
+                r"\bcity\s+"
+                r"(?:is\s+|:\s*)?"
+                r"([A-Za-z][A-Za-z\s-]*?)"
+                r"(?=\s*$)",
+                original,
+                re.IGNORECASE
+            )
+
+            if city_match:
+                city = city_match.group(1).strip()
+
+            # Name
+            name_match = re.search(
+                r"(?:name|called)"
+                r"\s*(?:is|:)?\s*"
+                r"([A-Za-z][A-Za-z\s'-]*?)"
+                r"(?=\s+(?:with|phone|number|city)\b|$)",
+                original,
+                re.IGNORECASE
+            )
+
+            if name_match:
+                name = name_match.group(1).strip()
+
+            return {
+                "action": "add",
+                "email": email,
+                "phone": phone,
+                "city": city,
+                "name": name
+            }
+
+    # ========================================================
+    # UPDATE
+    # ========================================================
+
+    update_match = re.search(
+        r"(?:update|change|set|modify)\s+"
+        r"(.+?)"
+        r"(?:['’]s)?\s+"
+        r"(city|phone|number|mobile|email|name)\s+"
+        r"(?:to|as|=)\s+"
+        r"(.+)$",
+        original,
+        re.IGNORECASE
+    )
+
+    if update_match:
+
+        identifier = clean_identifier(
+            update_match.group(1)
+        )
+
+        field = update_match.group(2).lower()
+
+        value = update_match.group(3).strip(
+            " .?!\"'"
+        )
+
+        if field in ["number", "mobile"]:
+            field = "phone"
+
+        return {
+            "action": "update",
+            "identifier": identifier,
+            "field": field,
+            "value": value
+        }
+
+    # ========================================================
+    # UPDATE USING EMAIL
+    # ========================================================
+
+    email = find_email(original)
+
+    if email and re.search(
+        r"\b(update|change|modify|set)\b",
+        original,
+        re.IGNORECASE
+    ):
+
+        city_match = re.search(
+            r"\bcity\s+(?:to|as|=)\s+(.+)$",
+            original,
+            re.IGNORECASE
+        )
+
+        if city_match:
+
+            return {
+                "action": "update",
+                "identifier": email,
+                "field": "city",
+                "value": city_match.group(1).strip(
+                    " .?!\"'"
+                )
+            }
+
+        phone_match = re.search(
+            r"\b(?:phone|number|mobile)"
+            r"\s+(?:to|as|=)\s+(.+)$",
+            original,
+            re.IGNORECASE
+        )
+
+        if phone_match:
+
+            return {
+                "action": "update",
+                "identifier": email,
+                "field": "phone",
+                "value": phone_match.group(1).strip(
+                    " .?!\"'"
+                )
+            }
+
+    return None
+
+
+# ============================================================
+# GROQ AI PARSER
+# ============================================================
+
+def parse_with_groq(command, api_key):
+
+    if not api_key:
+
+        return None, (
+            "Groq API key is not configured."
+        )
+
+    try:
+
+        client = Groq(api_key=api_key)
+
+        system_prompt = """
+You are a command parser for an admin
+user-management system.
+
+Convert the user's command into JSON.
+
+Allowed actions:
+
+1. add
+2. delete
+3. update
+
+ADD format:
+
+{
+  "action": "add",
+  "name": "",
+  "email": "",
+  "phone": "",
+  "city": ""
+}
+
+DELETE format:
+
+{
+  "action": "delete",
+  "identifier": ""
+}
+
+UPDATE format:
+
+{
+  "action": "update",
+  "identifier": "",
+  "field": "",
+  "value": ""
+}
+
+Allowed update fields:
+
+name
+email
+phone
+city
+
+Rules:
+
+- Do not invent information.
+- If the name is not provided when adding,
+  return an empty name.
+- The application will generate the name
+  from the email.
+- Identifier can be an email or name.
+- "John" can refer to "John Smith" if that
+  is the obvious matching user.
+- Phone, mobile, number and contact mean phone.
+- Return ONLY valid JSON.
+"""
+
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": command
+                }
+            ],
+            temperature=0,
+            max_tokens=300
+        )
+
+        response_text = response.choices[0].message.content.strip()
+
+        response_text = re.sub(
+            r"^```json\s*",
+            "",
+            response_text,
+            flags=re.IGNORECASE
+        )
+
+        response_text = re.sub(
+            r"\s*```$",
+            "",
+            response_text
+        )
+
+        parsed = json.loads(response_text)
+
+        if not isinstance(parsed, dict):
+
+            return None, (
+                "Groq returned an invalid response."
+            )
+
+        return parsed, None
+
+    except json.JSONDecodeError:
+
+        return None, (
+            "Groq returned invalid JSON."
+        )
+
+    except Exception as error:
+
+        return None, (
+            f"Groq error: {str(error)}"
+        )
+
+
+# ============================================================
+# EXECUTE COMMAND
+# ============================================================
+
+def execute_command(parsed):
+
+    if not parsed:
+
+        return False, (
+            "I could not understand that command."
+        )
+
+    action = str(
+        parsed.get("action", "")
+    ).lower().strip()
+
+    # ADD
+    if action == "add":
+
+        email = str(
+            parsed.get("email", "")
+        ).strip()
+
+        name = str(
+            parsed.get("name", "")
+        ).strip()
+
+        phone = str(
+            parsed.get("phone", "")
+        ).strip()
+
+        city = str(
+            parsed.get("city", "")
+        ).strip()
+
+        if not email:
+
+            return False, (
+                "Please provide an email address."
+            )
+
+        return add_user(
+            email=email,
+            phone=phone,
+            city=city,
+            name=name
+        )
+
+    # DELETE
+    if action in ["delete", "remove"]:
+
+        identifier = str(
+            parsed.get("identifier", "")
+        ).strip()
+
+        if not identifier:
+
+            return False, (
+                "Please provide the user's name "
+                "or email."
+            )
+
+        return remove_user(identifier)
+
+    # UPDATE
+    if action in [
+        "update",
+        "change",
+        "modify"
+    ]:
+
+        identifier = str(
+            parsed.get("identifier", "")
+        ).strip()
+
+        field = str(
+            parsed.get("field", "")
+        ).lower().strip()
+
+        value = str(
+            parsed.get("value", "")
+        ).strip()
+
+        if not identifier:
+
+            return False, (
+                "Please provide the user's name "
+                "or email."
+            )
+
+        if not field:
+
+            return False, (
+                "Please specify what you want "
+                "to update."
+            )
+
+        if not value:
+
+            return False, (
+                "Please provide the new value."
+            )
+
+        return update_user(
+            identifier=identifier,
+            field=field,
+            value=value
+        )
+
+    return False, (
+        "I understand commands for adding, "
+        "deleting, and updating users."
+    )
+
+
+# ============================================================
+# PROCESS COMMAND
+# ============================================================
+
+def process_command(command, api_key):
+
+    command = command.strip()
+
+    if not command:
+
+        return False, (
+            "Please enter a command."
+        )
+
+    # --------------------------------------------------------
+    # LOCAL PARSER FIRST
+    # --------------------------------------------------------
+
+    local_result = parse_local_command(command)
+
+    if local_result:
+
+        return execute_command(local_result)
+
+    # --------------------------------------------------------
+    # GROQ FALLBACK
+    # --------------------------------------------------------
+
+    if not api_key:
+
+        return False, (
+            "I could not understand this command.\n\n"
+            "Please save your Groq API key in "
+            "the sidebar."
+        )
+
+    groq_result, error = parse_with_groq(
+        command,
+        api_key
+    )
+
+    if error:
+
+        return False, error
+
+    return execute_command(groq_result)
+
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+if "admin_email" not in st.session_state:
+    st.session_state.admin_email = ""
+
+if "groq_api_key" not in st.session_state:
+    st.session_state.groq_api_key = ""
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+
+# ============================================================
+# LOGIN
+# ============================================================
+
+if not st.session_state.logged_in:
+
+    st.title(
+        "🤖 Admin User Management Chatbot"
+    )
+
+    st.subheader("Admin Login")
+
+    st.write(
+        "Enter your registered admin email "
+        "to continue."
+    )
+
+    login_email = st.text_input(
+        "Admin Email",
+        placeholder="Enter your registered email"
+    )
+
+    if st.button(
+        "Login",
+        type="primary",
+        use_container_width=True
+    ):
+
+        login_email = login_email.strip()
+
+        if not login_email:
+
+            st.error(
+                "Please enter your email address."
+            )
+
+        else:
+
+            user = get_user_by_email(
+                login_email
+            )
+
+            if user:
+
+                st.session_state.logged_in = True
+                st.session_state.admin_email = (
+                    login_email
+                )
+
+                st.success(
+                    "Login successful."
+                )
+
+                st.rerun()
+
+            else:
+
+                st.error(
+                    "This email is not registered "
+                    "in the system."
+                )
+
+    st.info(
+        "Enter the registered admin email "
+        "to log in."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.title("⚙️ Admin Panel")
+
+    st.write("Logged in as:")
+
+    st.code(
+        st.session_state.admin_email
+    )
+
+    st.divider()
+
+    # --------------------------------------------------------
+    # GROQ API KEY
+    # --------------------------------------------------------
+
+    st.subheader("Groq API Key")
+
+    api_key_input = st.text_input(
+        "Enter Groq API Key",
+        type="password",
+        value=st.session_state.groq_api_key,
+        placeholder="Paste your Groq API key"
+    )
+
+    if st.button(
+        "💾 Save API Key",
+        use_container_width=True
+    ):
+
+        api_key_input = api_key_input.strip()
+
+        if api_key_input:
+
+            st.session_state.groq_api_key = (
+                api_key_input
+            )
+
+            st.success(
+                "Groq API key saved."
+            )
+
+        else:
+
+            st.warning(
+                "Please enter a Groq API key."
+            )
+
+    # --------------------------------------------------------
+    # TEST GROQ
+    # --------------------------------------------------------
+
+    if st.button(
+        "🧪 Test Groq API",
+        use_container_width=True
+    ):
+
+        if not st.session_state.groq_api_key:
+
+            st.warning(
+                "Please save your Groq API key first."
+            )
+
+        else:
+
+            try:
+
+                client = Groq(
+                    api_key=st.session_state.groq_api_key
+                )
+
+                response = client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": "Reply with exactly: Groq API is working."
+                        }
+                    ],
+                    temperature=0,
+                    max_tokens=30
+                )
+
+                result = (
+                    response
+                    .choices[0]
+                    .message
+                    .content
+                    .strip()
+                )
+
+                st.success(
+                    "Groq API is working!"
+                )
+
+                st.write(result)
+
+            except Exception as error:
+
+                st.error(
+                    "Groq API test failed."
+                )
+
+                st.code(
+                    str(error)
+                )
+
+    st.caption(
+        f"Model: {GROQ_MODEL}"
+    )
+
+    st.divider()
+
+    # --------------------------------------------------------
+    # EXAMPLES
+    # --------------------------------------------------------
+
+    st.subheader("💡 Example Commands")
+
+    st.markdown("""
+**Add user**
+
+`Add the user john.smith@xyz.com with phone number +92332 and city Islamabad`
+
+**Delete user**
+
+`Remove the user john.smith@xyz.com`
+
+**Update city**
+
+`Update John's city to Islamabad`
+
+**Update using first name**
+
+`Update John city to Islamabad`
+
+**Update phone**
+
+`Change Samantha's phone to +923331234567`
+
+**Update email**
+
+`Change Samantha's email to samantha@xyz.com`
+
+**Rename user**
+
+`Update John to John Smith`
+""")
+
+    st.divider()
+
+    if st.button(
+        "Logout",
+        use_container_width=True
+    ):
+
+        st.session_state.logged_in = False
+        st.session_state.admin_email = ""
+        st.session_state.chat_history = []
+
+        st.rerun()
+
+
+# ============================================================
+# MAIN PAGE
+# ============================================================
+
+st.title(
+    "🤖 Admin User Management Chatbot"
+)
+
+st.write(
+    "Manage registered users using "
+    "normal English commands."
+)
+
+st.caption(
+    "Common commands are processed locally. "
+    "Groq is used for more complex commands."
+)
+
+
+# ============================================================
+# USERS TABLE
+# ============================================================
+
+st.subheader("👥 Registered Users")
+
+users_df = get_all_users()
+
+if not users_df.empty:
+
+    st.dataframe(
+        users_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+else:
+
+    st.info(
+        "There are currently no registered users."
+    )
+
+
+st.divider()
+
+
+# ============================================================
+# CHAT
+# ============================================================
+
+st.subheader("💬 Chat")
+
+for message in st.session_state.chat_history:
+
+    if message["role"] == "user":
+
+        with st.chat_message("user"):
+
+            st.write(
+                message["content"]
+            )
+
+    else:
+
+        with st.chat_message("assistant"):
+
+            if message.get("success", False):
+
+                st.success(
+                    message["content"]
+                )
+
+            else:
+
+                st.error(
+                    message["content"]
+                )
+
+
+user_command = st.chat_input(
+    "Example: Update John's city to Islamabad"
+)
+
+
+if user_command:
+
+    with st.chat_message("user"):
+
+        st.write(user_command)
+
+    st.session_state.chat_history.append({
+        "role": "user",
+        "content": user_command
+    })
+
+    success, response = process_command(
+        user_command,
+        st.session_state.groq_api_key
+    )
+
+    with st.chat_message("assistant"):
+
+        if success:
+
+            st.success(response)
+
+        else:
+
+            st.error(response)
+
+    st.session_state.chat_history.append({
+        "role": "assistant",
+        "content": response,
+        "success": success
+    })
+
+    st.rerun()# grok api worked with fast responses
